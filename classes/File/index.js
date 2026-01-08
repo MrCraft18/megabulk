@@ -120,18 +120,31 @@ export default class File {
         const startByte = fs.existsSync(streamPath) ? fs.statSync(streamPath).size : 0
 
         try {
+            const controller = new AbortController()
+            function resetTimeout() {
+                clearTimeout(controller.timeoutId)
+                controller.timeoutId = setTimeout(() => {
+                    const err = new Error("Stream timeout")
+                    err.code = "ETIMEDOUT"
+                    controller.abort(err)
+                }, 10_000)
+            }
+            resetTimeout()
+
             const stream = await axios.get(this.downloadURL, {
                 responseType: "stream",
                 headers: startByte ? { Range: `bytes=${startByte}-` } : {},
                 httpAgent: this.proxy.agent,
                 httpsAgent: this.proxy.agent,
                 proxy: false,
-                timeout: 20_000
+                signal: controller.signal
             })
 
             let downloaded = 0
 
             stream.data.on("data", chunk => {
+                resetTimeout()
+                const now = Date.now()
                 downloaded += chunk.length
                 console.log(`(${downloaded}/${this.size})`)
             })
@@ -139,8 +152,12 @@ export default class File {
             fs.mkdirSync(path.join(this.process.downloadDirectory, this.directoryPath), { recursive: true })
 
             await pipeline(stream.data, fs.createWriteStream(streamPath))
+            clearTimeout(controller.timeoutId)
         } catch (error) {
             console.error(error)
+            if (error?.code === "ERR_CANCELED" && error?.cause?.code === "ETIMEDOUT") {
+                error = error.cause
+            }
 
             console.log(`Download Failed For: ${this.name} Concurrent Downloads: ${this.process.queueCount('downloading') - 1}`)
 
