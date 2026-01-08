@@ -17,10 +17,21 @@ export default class MegabulkProcess {
 
         this.maxConcurrentDownloads = 1
         this.maxConcurrentProxyChecking = 50
+
+        this.proxyPools = {
+            base: new Map(),
+            working: new Map(),
+            broken: new Map()
+        }
+
+        this.foundNewProxiesPromise = null
     }
 
     async start() {
-        await this.startProxyManager()
+        await this.findAndInsertProxies()
+        setInterval(() => {
+            if (!this.foundNewProxiesPromise) this.findAndInsertProxies()
+        }, 60 * 60_000)
 
         this.allNodes = await axios.post('https://g.api.mega.co.nz/cs', [{ a: "f", c: 1, r: 1 }], {
             params: { id: Date.now(), n: this.folderHandle },
@@ -28,6 +39,11 @@ export default class MegabulkProcess {
         }).then(response => response.data[0].f)
 
         this.fileQueue = this.allNodes.filter(node => node.t === 0).map(node => new File(node, this))
+
+        if (!this.fileQueue.length) {
+            console.log('No files in Folder to Download')
+            return
+        }
 
         this.enqueueFileDownloads()
 
@@ -49,14 +65,9 @@ export default class MegabulkProcess {
         return status ? this.fileQueue.filter(file => file.status == status).length : this.fileQueue.length
     }
 
-    async startProxyManager() {
-        this.proxies = new Map()
-
-        await this.findAndInsertProxies()
-        setInterval(() => this.findAndInsertProxies(), 60_000 * 60)
-    }
-
     async findAndInsertProxies() {
+        let added = 0
+
         const fetchedProxies =  [
             ...(await axios.get('https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/all/data.txt').then(response => response.data)).split('\n'),
             ...(await axios.get('https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt').then(response => response.data)).split('\n').map(address => 'socks5://' + address),
@@ -64,15 +75,16 @@ export default class MegabulkProcess {
             ...(await axios.get('https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt').then(response => response.data)).split('\n').map(address => 'http://' + address),
         ]
 
-        for (const proxy of fetchedProxies) {
-            if (!this.proxies.get(proxy)) {
-
-                this.proxies.set(proxy, {
+        for (const proxy of fetchedProxies.map(value => value.trim()).filter(Boolean)) {
+            if (!this.hasProxy(proxy)) {
+                this.proxyPools.base.set(proxy, {
                     address: proxy,
                     agent: makeAgent(proxy),
                     attempts: 0,
-                    lastUsed: new Date(0)
+                    lastUsed: 0,
+                    cooldownUntil: 0
                 })
+                added++
             }
         }
 
@@ -91,29 +103,91 @@ export default class MegabulkProcess {
 
             throw new Error(`Unknown proxy URL: ${proxyURL}`)
         }
+
+        return added
     }
 
-    popProxy() {
-        if (this.proxies.size === 0) return null
+    async popProxy() {
+        const proxy = (() => {
+            if (this.proxyPools.working.size > 0) {
+                const target = Math.floor(Math.random() * this.proxyPools.working.size)
+                let i = 0
+                for (const [k, v] of this.proxyPools.working) {
+                    if (i === target) {
+                        this.proxyPools.working.delete(k)
+                        v.lastUsed = Date.now()
+                        return v
+                    }
+                    i++
+                }
+            }
 
-        const working = []
-        const unchecked = []
+            if (this.proxyPools.base.size > 0) {
+                let oldestKey = null
+                let oldestProxy = null
 
-        for (const [k, v] of this.proxies) {
-            if (v.status === "working") working.push([k, v])
-            else if (v.status === "unchecked") unchecked.push([k, v])
+                for (const [k, v] of this.proxyPools.base) {
+                    if (!oldestProxy || v.lastUsed < oldestProxy.lastUsed) {
+                        oldestKey = k
+                        oldestProxy = v
+                    }
+                }
+
+                if (oldestKey) {
+                    this.proxyPools.base.delete(oldestKey)
+                    oldestProxy.lastUsed = Date.now()
+                    return oldestProxy
+                }
+            }
+
+            return null
+        })()
+
+        if (proxy) {
+            const now = Date.now()
+            if (proxy.cooldownUntil && proxy.cooldownUntil > now) {
+                await new Promise(res => setTimeout(res, proxy.cooldownUntil - now))
+            }
+            return proxy
         }
 
-        const candidates = working.length > 0 ? working : unchecked
-        if (candidates.length === 0) return null
+        if (!this.foundNewProxiesPromise) {
+            this.startProxyRefreshLoop()
+        }
 
-        const target = Math.floor(Math.random() * candidates.length)
-        const [k, v] = candidates[target]
-        this.proxies.delete(k)
-        return v
+        await this.foundNewProxiesPromise
+        return await this.popProxy()
     }
 
-    insertProxy(proxy) {
-        this.proxies.set(proxy.address, proxy)
+    async startProxyRefreshLoop() {
+        const { promise, resolve } = Promise.withResolvers()
+        this.foundNewProxiesPromise = promise
+        const resolveFoundNewProxies = resolve
+
+        let added = await this.findAndInsertProxies()
+
+        while (!added) {
+            added = await this.findAndInsertProxies()
+            await new Promise(res => setTimeout(res, 5 * 60_000))
+        }
+
+        resolveFoundNewProxies()
+        this.foundNewProxiesPromise = null
+    }
+
+    hasProxy(address) {
+        return this.proxyPools.base.has(address) || this.proxyPools.working.has(address) || this.proxyPools.broken.has(address)
+    }
+
+    reinsertProxy(proxy, pool = 'base') {
+        if (!proxy) throw new Error('No proxy passed to reinsertProxy')
+
+        if (pool === 'working') proxy.attempts = 0
+        if (proxy.attempts >= 5) pool = 'broken'
+
+        this.proxyPools.base.delete(proxy.address)
+        this.proxyPools.working.delete(proxy.address)
+        this.proxyPools.broken.delete(proxy.address)
+        this.proxyPools[pool].set(proxy.address, proxy)
     }
 }

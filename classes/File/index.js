@@ -60,13 +60,12 @@ export default class File {
             if (this.process.queueCount('downloading') >= this.process.maxConcurrentDownloads) {
                 this.status = 'waiting'
 
-                delete this.proxy
                 delete this.downloadURL
 
                 return
             }
 
-            this.proxy = this.process.popProxy()
+            this.proxy = await this.process.popProxy()
 
             if (!this.proxy) throw new Error('Ran out of proxies')
 
@@ -86,17 +85,23 @@ export default class File {
             } catch (error) {
                 console.log(`Proxy: ${this.proxy.address} Request Error: ${error}`)
 
-                this.proxy.status = 'broken'
-                this.process.insertProxy(this.proxy)
+                if (this.isTimeoutError(error)) {
+                    this.proxy.attempts++
+                    this.returnProxy()
+                    console.log('Returned Proxy as Timeout')
+                } else {
+                    this.returnProxy('broken')
+                    console.log('Returned Proxy as Broken For Sure')
+                }
+
             }
         }
 
         if (this.process.queueCount('downloading') >= this.process.maxConcurrentDownloads) {
             this.status = 'waiting'
 
-            this.process.insertProxy(this.proxy)
+            this.returnProxy('working')
             
-            delete this.proxy
             delete this.downloadURL
 
             return
@@ -141,14 +146,16 @@ export default class File {
 
             if (error?.response?.status === 509) {
                 console.log(`Download limit exceeded for : ${this.proxy.address}`)
-                this.proxy.lastTried = new Date()
+                //Set some type of cooldown for the proxy here
+                this.proxy.cooldownUntil = Date.now() + 5 * 60_000
+                this.returnProxy()
+            } else if (this.isTimeoutError(error)) {
+                this.proxy.attempts++
+                this.returnProxy()
             } else {
-                this.proxy.broken = true
+                this.returnProxy('broken')
             }
 
-            this.process.insertProxy(this.proxy)
-
-            delete this.proxy
             delete this.downloadURL
 
             this.download()
@@ -162,8 +169,7 @@ export default class File {
         console.log(`Finished Downloading File: ${this.name} Concurrent Downloads: ${this.process.queueCount('downloading')}`)
         console.log(`Files left to download: ${this.process.queueCount('waiting') + this.process.queueCount('finding proxy') + this.process.queueCount('downloading')}`)
 
-        this.proxy.status = 'working'
-        this.process.insertProxy(this.proxy)
+        this.returnProxy('working')
 
         if (this.process.fileQueue.length === 0) {
             this.process.resolveAllFilesDownloaded()
@@ -172,7 +178,17 @@ export default class File {
         }
     }
 
+    returnProxy(pool) {
+        this.process.reinsertProxy(this.proxy, pool)
+        delete this.proxy
+    }
+
     alreadyDownloaded() {
         return fs.existsSync(path.join(this.process.downloadDirectory, this.directoryPath, `.downloaded.${this.name}`))
+    }
+
+    isTimeoutError(error) {
+        const code = error?.code
+        return code === "ETIMEDOUT" || code === "ECONNRESET" || code === "ECONNABORTED" || error?.name === "AbortError"
     }
 }
