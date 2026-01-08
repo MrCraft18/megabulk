@@ -1,4 +1,7 @@
 import axios from "axios"
+import fs from "fs"
+import path from "path";
+import { pipeline } from "node:stream/promises"
 
 import decryptNodeAttributes from "./functions/decryptNodeAttributes.js";
 
@@ -37,11 +40,24 @@ export default class File {
     }
 
     async download() {
+        console.log(this.alreadyDownloaded(), path.join(this.process.downloadDirectory, this.directoryPath, `.downloaded.${this.name}`))
+        if (this.alreadyDownloaded()) {
+            this.status = "already downloaded"
+            console.log(`Already downloaded ${this.name}`)
+
+            if (this.process.fileQueue.length === 0) {
+                this.process.resolveAllFilesDownloaded()
+            } else {
+                this.process.enqueueFileDownloads()
+            }
+
+            return
+        }
+
         this.status = 'finding proxy'
 
         while (!this.downloadURL) {
-            if (this.process.fileQueue.filter(file => file.status === 'downloading').length >= 6) {
-                console.log('I was checking proxies but 6 files already downloading')
+            if (this.process.queueCount('downloading') >= this.process.maxConcurrentDownloads) {
                 this.status = 'waiting'
 
                 delete this.proxy
@@ -61,7 +77,7 @@ export default class File {
                     httpAgent: this.proxy.agent,
                     httpsAgent: this.proxy.agent,
                     proxy: false,
-                    signal: AbortSignal.timeout(5000)
+                    signal: AbortSignal.timeout(10000)
                 })
 
                 console.log(response.data)
@@ -75,11 +91,9 @@ export default class File {
             }
         }
 
-        if (this.process.fileQueue.filter(file => file.status === 'downloading').length >= 6) {
-            console.log('I found a good proxy but 6 files already downloading')
+        if (this.process.queueCount('downloading') >= this.process.maxConcurrentDownloads) {
             this.status = 'waiting'
 
-            this.proxy.status = 'working'
             this.process.insertProxy(this.proxy)
             
             delete this.proxy
@@ -88,15 +102,65 @@ export default class File {
             return
         }
 
+        this.streamFile()
+    }
+
+    async streamFile() {
         this.status = 'downloading'
         this.process.enqueueFileDownloads()
 
-        console.log(`Downloading File: ${this.name} Concurrent Downloads: ${this.process.fileQueue.filter(file => file.status === 'downloading').length}`)
-        await new Promise(res => setTimeout(res, 60000))
+        console.log(`Downloading File: ${this.name} Concurrent Downloads: ${this.process.queueCount('downloading')}`)
 
-        this.process.removeFileFromQueue(this)
-        console.log(`Finished Downloading File: ${this.name} Concurrent Downloads: ${this.process.fileQueue.filter(file => file.status === 'downloading').length}`)
-        console.log(`Files left to download: ${this.process.fileQueue.length}`)
+        const streamPath = path.join(this.process.downloadDirectory, this.directoryPath, `${this.name}.part`)
+        const startByte = fs.existsSync(streamPath) ? fs.statSync(streamPath).size : 0
+
+        try {
+            const stream = await axios.get(this.downloadURL, {
+                responseType: "stream",
+                headers: startByte ? { Range: `bytes=${startByte}-` } : {},
+                httpAgent: this.proxy.agent,
+                httpsAgent: this.proxy.agent,
+                proxy: false,
+                timeout: 20_000
+            })
+
+            let downloaded = 0
+
+            stream.data.on("data", chunk => {
+                downloaded += chunk.length
+                console.log(`(${downloaded}/${this.size})`)
+            })
+
+            fs.mkdirSync(path.join(this.process.downloadDirectory, this.directoryPath), { recursive: true })
+
+            await pipeline(stream.data, fs.createWriteStream(streamPath))
+        } catch (error) {
+            console.error(error)
+
+            console.log(`Download Failed For: ${this.name} Concurrent Downloads: ${this.process.queueCount('downloading') - 1}`)
+
+            if (error?.response?.status === 509) {
+                console.log(`Download limit exceeded for : ${this.proxy.address}`)
+                this.proxy.lastTried = new Date()
+            } else {
+                this.proxy.broken = true
+            }
+
+            this.process.insertProxy(this.proxy)
+
+            delete this.proxy
+            delete this.downloadURL
+
+            this.download()
+            return
+        }
+
+        fs.renameSync(path.join(this.process.downloadDirectory, this.directoryPath, `${this.name}.part`), path.join(this.process.downloadDirectory, this.directoryPath, this.name))
+        fs.writeFileSync(path.join(this.process.downloadDirectory, this.directoryPath, `.downloaded.${this.name}`), '')
+
+        this.status = 'downloaded'
+        console.log(`Finished Downloading File: ${this.name} Concurrent Downloads: ${this.process.queueCount('downloading')}`)
+        console.log(`Files left to download: ${this.process.queueCount('waiting') + this.process.queueCount('finding proxy') + this.process.queueCount('downloading')}`)
 
         this.proxy.status = 'working'
         this.process.insertProxy(this.proxy)
@@ -106,5 +170,9 @@ export default class File {
         } else {
             this.process.enqueueFileDownloads()
         }
+    }
+
+    alreadyDownloaded() {
+        return fs.existsSync(path.join(this.process.downloadDirectory, this.directoryPath, `.downloaded.${this.name}`))
     }
 }

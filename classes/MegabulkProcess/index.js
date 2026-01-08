@@ -14,6 +14,9 @@ export default class MegabulkProcess {
 
         const folderKeyB64 = folderLink.split('#').at(-1)
         this.folderKey = b64urlToBuffer(folderKeyB64).toString('hex')
+
+        this.maxConcurrentDownloads = 1
+        this.maxConcurrentProxyChecking = 50
     }
 
     async start() {
@@ -36,17 +39,14 @@ export default class MegabulkProcess {
     }
 
     enqueueFileDownloads() {
-        while (this.fileQueue.filter(file => file.status === 'finding proxy').length < 50 && this.fileQueue.filter(file => file.status === 'downloading').length < 6) {
+        while (this.queueCount('finding proxy') < this.maxConcurrentProxyChecking && this.queueCount('downloading') < this.maxConcurrentDownloads) {
             const awaitingFile = this.fileQueue.find(file => file.status === 'waiting')
             awaitingFile.download()
         }
     }
 
-    removeFileFromQueue(fileToRemove) {
-        const idx = this.fileQueue.findIndex(file => file.id === fileToRemove.id)
-        if (idx === -1) return false
-        this.fileQueue.splice(idx, 1)
-        return true
+    queueCount(status) {
+        return status ? this.fileQueue.filter(file => file.status == status).length : this.fileQueue.length
     }
 
     async startProxyManager() {
@@ -67,7 +67,12 @@ export default class MegabulkProcess {
         for (const proxy of fetchedProxies) {
             if (!this.proxies.get(proxy)) {
 
-                this.proxies.set(proxy, { address: proxy, status: 'unchecked', agent: makeAgent(proxy) })
+                this.proxies.set(proxy, {
+                    address: proxy,
+                    agent: makeAgent(proxy),
+                    attempts: 0,
+                    lastUsed: new Date(0)
+                })
             }
         }
 
