@@ -37,13 +37,20 @@ export default class File {
         this.timestamp = node.ts
 
         this.status = 'waiting'
+
+        this.downloadedBytes = 0
+        this.startedAt = null
+        this.lastTickBytes = 0
+        this.lastTickTime = 0
+        this.speed = 0
+        this.eta = 0
+        this.speedSamples = []
     }
 
     async download() {
-        console.log(this.alreadyDownloaded(), path.join(this.process.downloadDirectory, this.directoryPath, `.downloaded.${this.name}`))
         if (this.alreadyDownloaded()) {
+            this.downloadedBytes = this.size
             this.status = "already downloaded"
-            console.log(`Already downloaded ${this.name}`)
 
             if (this.process.fileQueue.length === 0) {
                 this.process.resolveAllFilesDownloaded()
@@ -79,19 +86,13 @@ export default class File {
                     signal: AbortSignal.timeout(10000)
                 })
 
-                console.log(response.data)
-                console.log('Success!')
                 this.downloadURL = response.data[0].g
             } catch (error) {
-                console.log(`Proxy: ${this.proxy.address} Request Error: ${error}`)
-
                 if (this.isTimeoutError(error)) {
                     this.proxy.attempts++
                     this.returnProxy()
-                    console.log('Returned Proxy as Timeout')
                 } else {
                     this.returnProxy('broken')
-                    console.log('Returned Proxy as Broken For Sure')
                 }
 
             }
@@ -114,10 +115,13 @@ export default class File {
         this.status = 'downloading'
         this.process.enqueueFileDownloads()
 
-        console.log(`Downloading File: ${this.name} Concurrent Downloads: ${this.process.queueCount('downloading')}`)
-
         const streamPath = path.join(this.process.downloadDirectory, this.directoryPath, `${this.name}.part`)
         const startByte = fs.existsSync(streamPath) ? fs.statSync(streamPath).size : 0
+        this.downloadedBytes = startByte
+        this.startedAt = Date.now()
+        this.lastTickBytes = this.downloadedBytes
+        this.lastTickTime = this.startedAt
+        this.speedSamples = [{ time: this.startedAt, bytes: this.downloadedBytes }]
 
         try {
             const controller = new AbortController()
@@ -146,7 +150,25 @@ export default class File {
                 resetTimeout()
                 const now = Date.now()
                 downloaded += chunk.length
-                console.log(`(${downloaded}/${this.size})`)
+                this.downloadedBytes += chunk.length
+                const deltaTime = (now - this.lastTickTime) / 1000
+                if (deltaTime > 0) {
+                    this.speedSamples.push({ time: now, bytes: this.downloadedBytes })
+                    const windowMs = 30000
+                    while (this.speedSamples.length > 1 && now - this.speedSamples[0].time > windowMs) {
+                        this.speedSamples.shift()
+                    }
+                    const oldest = this.speedSamples[0]
+                    const newest = this.speedSamples[this.speedSamples.length - 1]
+                    const windowTime = (newest.time - oldest.time) / 1000
+                    if (windowTime > 0) {
+                        this.speed = (newest.bytes - oldest.bytes) / windowTime
+                    }
+                    const remaining = Math.max(this.size - this.downloadedBytes, 0)
+                    this.eta = this.speed > 0 ? remaining / this.speed : 0
+                }
+                this.lastTickBytes = this.downloadedBytes
+                this.lastTickTime = now
             })
 
             fs.mkdirSync(path.join(this.process.downloadDirectory, this.directoryPath), { recursive: true })
@@ -154,16 +176,11 @@ export default class File {
             await pipeline(stream.data, fs.createWriteStream(streamPath))
             clearTimeout(controller.timeoutId)
         } catch (error) {
-            console.error(error)
             if (error?.code === "ERR_CANCELED" && error?.cause?.code === "ETIMEDOUT") {
                 error = error.cause
             }
 
-            console.log(`Download Failed For: ${this.name} Concurrent Downloads: ${this.process.queueCount('downloading') - 1}`)
-
             if (error?.response?.status === 509) {
-                console.log(`Download limit exceeded for : ${this.proxy.address}`)
-                //Set some type of cooldown for the proxy here
                 this.proxy.cooldownUntil = Date.now() + 5 * 60_000
                 this.returnProxy()
             } else if (this.isTimeoutError(error)) {
@@ -182,10 +199,8 @@ export default class File {
         fs.renameSync(path.join(this.process.downloadDirectory, this.directoryPath, `${this.name}.part`), path.join(this.process.downloadDirectory, this.directoryPath, this.name))
         fs.writeFileSync(path.join(this.process.downloadDirectory, this.directoryPath, `.downloaded.${this.name}`), '')
 
+        this.downloadedBytes = this.size
         this.status = 'downloaded'
-        console.log(`Finished Downloading File: ${this.name} Concurrent Downloads: ${this.process.queueCount('downloading')}`)
-        console.log(`Files left to download: ${this.process.queueCount('waiting') + this.process.queueCount('finding proxy') + this.process.queueCount('downloading')}`)
-
         this.returnProxy('working')
 
         if (this.process.fileQueue.length === 0) {

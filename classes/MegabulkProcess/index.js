@@ -15,7 +15,7 @@ export default class MegabulkProcess {
         const folderKeyB64 = folderLink.split('#').at(-1)
         this.folderKey = b64urlToBuffer(folderKeyB64).toString('hex')
 
-        this.maxConcurrentDownloads = 1
+        this.maxConcurrentDownloads = 10
         this.maxConcurrentProxyChecking = 50
 
         this.proxyPools = {
@@ -39,12 +39,16 @@ export default class MegabulkProcess {
         }).then(response => response.data[0].f)
 
         this.fileQueue = this.allNodes.filter(node => node.t === 0).map(node => new File(node, this))
+        this.totalFiles = this.fileQueue.length
+        this.totalBytes = this.fileQueue.reduce((sum, file) => sum + (file.size || 0), 0)
 
         if (!this.fileQueue.length) {
             console.log('No files in Folder to Download')
             return
         }
 
+        console.clear()
+        this.startRenderLoop()
         this.enqueueFileDownloads()
 
         const { promise, resolve, reject } = Promise.withResolvers()
@@ -189,5 +193,139 @@ export default class MegabulkProcess {
         this.proxyPools.working.delete(proxy.address)
         this.proxyPools.broken.delete(proxy.address)
         this.proxyPools[pool].set(proxy.address, proxy)
+    }
+
+
+    startRenderLoop() {
+        if (this.renderInterval) return
+        this.lastRenderLines = 0
+        this.lastRenderRows = process.stdout.rows || 24
+        process.stdout.write("\x1b[?25l")
+        this.configureScrollRegion()
+        this.renderInterval = setInterval(() => this.render(), 200)
+    }
+
+    stopRenderLoop() {
+        if (!this.renderInterval) return
+        clearInterval(this.renderInterval)
+        this.renderInterval = null
+        process.stdout.write("\x1b[r")
+        process.stdout.write("\x1b[?25h")
+    }
+
+    configureScrollRegion() {
+        const rows = process.stdout.rows || 24
+        this.renderRegionSize = Math.max(this.maxConcurrentDownloads + 2, 2)
+        const bottom = Math.max(rows - this.renderRegionSize, 1)
+        process.stdout.write(`\x1b[1;${bottom}r`)
+    }
+
+    render() {
+        const ESC = "\x1b["
+        const clearLine = () => process.stdout.write(ESC + "2K")
+        const moveTo = (row, col) => process.stdout.write(`${ESC}${row};${col}H`)
+        const saveCursor = () => process.stdout.write(ESC + "s")
+        const restoreCursor = () => process.stdout.write(ESC + "u")
+        const columns = process.stdout.columns || 80
+        const rows = process.stdout.rows || 24
+
+        if (rows !== this.lastRenderRows) {
+            this.lastRenderRows = rows
+            this.configureScrollRegion()
+        }
+
+        const activeFiles = this.fileQueue.filter(file => file.status === 'downloading')
+        const lines = []
+
+        for (const file of activeFiles) {
+            lines.push([
+                file.name,
+                this.formatBytes(file.size, { fixedDecimals: 2 }),
+                `${this.formatPercent(file.downloadedBytes, file.size)}`,
+                this.formatSpeed(file.speed),
+                this.formatEta(file.eta)
+            ].join(" | "))
+        }
+
+        if (lines.length > 0) {
+            lines.push("-".repeat(Math.max(columns - 1, 0)))
+        }
+
+        const usableProxies = this.proxyPools.base.size + this.proxyPools.working.size
+        const totalProxies = usableProxies + this.proxyPools.broken.size
+        const downloadedFiles = this.fileQueue.filter(file => file.status === 'downloaded' || file.status === 'already downloaded').length
+        const bytesSoFar = this.fileQueue.reduce((sum, file) => sum + (file.downloadedBytes || 0), 0)
+        const activeCount = activeFiles.length
+        const combinedSpeed = activeFiles.reduce((sum, file) => sum + (file.speed || 0), 0)
+        const remainingBytes = Math.max(this.totalBytes - bytesSoFar, 0)
+        const totalEta = combinedSpeed > 0 ? remainingBytes / combinedSpeed : 0
+
+        lines.push([
+            `${usableProxies}/${totalProxies} proxies`,
+            `${downloadedFiles}/${this.totalFiles} files`,
+            `${this.formatBytes(bytesSoFar, { fixedDecimals: 2 })}/${this.formatBytes(this.totalBytes, { fixedDecimals: 2 })}`,
+            `${activeCount} downloading`,
+            this.formatSpeed(combinedSpeed),
+            this.formatEta(totalEta)
+        ].join(" | "))
+
+        const regionSize = this.renderRegionSize || Math.max(this.maxConcurrentDownloads + 2, 2)
+        const regionStart = Math.max(1, rows - regionSize + 1)
+        const startRow = Math.max(regionStart, rows - lines.length + 1)
+
+        saveCursor()
+        for (let i = 0; i < regionSize; i++) {
+            const row = regionStart + i
+            moveTo(row, 1)
+            clearLine()
+        }
+        for (let i = 0; i < lines.length; i++) {
+            const row = startRow + i
+            moveTo(row, 1)
+            const line = lines[i].slice(0, Math.max(columns - 1, 0))
+            process.stdout.write(line)
+        }
+        restoreCursor()
+
+        this.lastRenderLines = lines.length
+    }
+
+    formatBytes(bytes, options = {}) {
+        if (!bytes || bytes <= 0) return "0 B"
+        const units = ["B", "KB", "MB", "GB", "TB"]
+        let value = bytes
+        let unit = 0
+        while (value >= 1024 && unit < units.length - 1) {
+            value /= 1024
+            unit++
+        }
+        if (options.fixedDecimals !== undefined) {
+            return `${value.toFixed(options.fixedDecimals)} ${units[unit]}`
+        }
+        const gbDecimals = options.gbDecimals ?? 1
+        const decimals = unit >= 3 ? gbDecimals : (value >= 10 || unit === 0 ? 0 : 1)
+        return `${value.toFixed(decimals)} ${units[unit]}`
+    }
+
+    formatSpeed(bytesPerSecond) {
+        return `${this.formatBytes(bytesPerSecond)}/s`
+    }
+
+    formatPercent(done, total) {
+        if (!total) return "0%"
+        const pct = Math.min(Math.max(done / total, 0), 1) * 100
+        return `${pct.toFixed(1)}%`
+    }
+
+    formatEta(seconds) {
+        if (!seconds || seconds <= 0) return "--:--"
+        const mins = Math.floor(seconds / 60)
+        const secs = Math.floor(seconds % 60)
+        const hours = Math.floor(mins / 60)
+        const remMins = mins % 60
+        if (hours > 0) {
+            return `${hours}:${String(remMins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`
+        }
+        return `${remMins}:${String(secs).padStart(2, "0")}`
     }
 }
