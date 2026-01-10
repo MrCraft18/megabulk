@@ -61,6 +61,7 @@ export default class MegabulkProcess {
     enqueueFileDownloads() {
         while (this.queueCount('finding proxy') < this.maxConcurrentProxyChecking && this.queueCount('downloading') < this.maxConcurrentDownloads) {
             const awaitingFile = this.fileQueue.find(file => file.status === 'waiting')
+            if (!awaitingFile) break
             awaitingFile.download()
         }
     }
