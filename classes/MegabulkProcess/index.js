@@ -3,7 +3,7 @@ import { HttpsProxyAgent } from "https-proxy-agent"
 import { SocksProxyAgent } from "socks-proxy-agent"
 
 import File from '../File/index.js'
-import b64urlToBuffer from "../../common/b64urlToBuffer.js"
+import { b64urlToBuffer } from "../../common/megaCrypto.js"
 
 export default class MegabulkProcess {
     constructor({ folderLink, downloadDirectory }) {

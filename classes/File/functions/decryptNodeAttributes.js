@@ -1,28 +1,6 @@
-import { Buffer } from "node:buffer"
-import crypto from "node:crypto"
-
-import b64urlToBuffer from "../../../common/b64urlToBuffer.js"
+import { aes128EcbDecrypt, aes128CbcDecrypt, xor32hex, b64urlToBuffer } from "../../../common/megaCrypto.js"
 
 export default function decryptNodeAttributes(node, folderKey) {
-    function aes128EcbDecrypt(keyHex, dataBuf) {
-        const key = Buffer.from(keyHex, "hex")
-        const decipher = crypto.createDecipheriv("aes-128-ecb", key, null)
-        decipher.setAutoPadding(false)
-        return Buffer.concat([decipher.update(dataBuf), decipher.final()])
-    }
-
-    function aes128CbcDecrypt(keyHex, dataBuf) {
-        const key = Buffer.from(keyHex, "hex")
-        const iv = Buffer.alloc(16, 0)
-        const decipher = crypto.createDecipheriv("aes-128-cbc", key, iv)
-        decipher.setAutoPadding(false)
-        return Buffer.concat([decipher.update(dataBuf), decipher.final()])
-    }
-
-    function xor32hex(a, b) {
-        const x = (parseInt(a, 16) ^ parseInt(b, 16)) >>> 0
-        return x.toString(16).padStart(8, "0")
-    }
 
     const nodeKeyB64 = node.k.split(':').at(-1)
     const nodeKeyBytes = b64urlToBuffer(nodeKeyB64)

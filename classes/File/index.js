@@ -2,8 +2,9 @@ import axios from "axios"
 import fs from "fs"
 import path from "path";
 import { pipeline } from "node:stream/promises"
-
+import crypto from "node:crypto"
 import decryptNodeAttributes from "./functions/decryptNodeAttributes.js";
+import { aes128EcbDecrypt, xor32hex, b64urlToBuffer } from "../../common/megaCrypto.js"
 
 export default class File {
     constructor(node, process) {
@@ -154,6 +155,7 @@ export default class File {
                     reject(error)
                 })
             })
+
             stream.data.on("data", chunk => {
                 resetTimeout()
                 const now = Date.now()
