@@ -200,6 +200,8 @@ export default class MegabulkProcess {
         if (this.renderInterval) return
         this.lastRenderLines = 0
         this.lastRenderRows = process.stdout.rows || 24
+        this.renderStartTime = Date.now()
+        this.bytesAtRenderStart = this.fileQueue.reduce((sum, file) => sum + (file.downloadedBytes || 0), 0)
         process.stdout.write("\x1b[?25l")
         this.configureScrollRegion()
         this.renderInterval = setInterval(() => this.render(), 200)
@@ -258,7 +260,15 @@ export default class MegabulkProcess {
         const activeCount = activeFiles.length
         const combinedSpeed = activeFiles.reduce((sum, file) => sum + (file.speed || 0), 0)
         const remainingBytes = Math.max(this.totalBytes - bytesSoFar, 0)
-        const totalEta = combinedSpeed > 0 ? remainingBytes / combinedSpeed : 0
+        const elapsed = this.renderStartTime ? (Date.now() - this.renderStartTime) / 1000 : 0
+        const bytesDelta = this.fileQueue.reduce((sum, file) => {
+            if (!file.startedAt) return sum
+            const startByte = file.startByte || 0
+            const delta = Math.max((file.downloadedBytes || 0) - startByte, 0)
+            return sum + delta
+        }, 0)
+        const avgSpeed = elapsed > 0 ? bytesDelta / elapsed : 0
+        const totalEta = avgSpeed > 0 ? remainingBytes / avgSpeed : 0
 
         lines.push([
             `${usableProxies}/${totalProxies} proxies`,

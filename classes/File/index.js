@@ -118,6 +118,7 @@ export default class File {
 
         const streamPath = path.join(this.process.downloadDirectory, this.directoryPath, `${this.name}.part`)
         const startByte = fs.existsSync(streamPath) ? fs.statSync(streamPath).size : 0
+        this.startByte = startByte
         this.downloadedBytes = startByte
         this.startedAt = Date.now()
         this.lastTickBytes = this.downloadedBytes
@@ -172,7 +173,10 @@ export default class File {
                         this.speed = (newest.bytes - oldest.bytes) / windowTime
                     }
                     const remaining = Math.max(this.size - this.downloadedBytes, 0)
-                    this.eta = this.speed > 0 ? remaining / this.speed : 0
+                    const elapsed = (now - this.startedAt) / 1000
+                    const bytesDelta = Math.max(this.downloadedBytes - (this.startByte || 0), 0)
+                    const avgSpeed = elapsed > 0 ? bytesDelta / elapsed : 0
+                    this.eta = avgSpeed > 0 ? remaining / avgSpeed : 0
                 }
                 this.lastTickBytes = this.downloadedBytes
                 this.lastTickTime = now
