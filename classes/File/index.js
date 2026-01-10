@@ -8,6 +8,7 @@ import decryptNodeAttributes from "./functions/decryptNodeAttributes.js";
 export default class File {
     constructor(node, process) {
         this.process = process
+        this.node = node
 
         const attributes = JSON.parse(decryptNodeAttributes({ a: node.a, k: node.k }, this.process.folderKey))
 
@@ -173,7 +174,10 @@ export default class File {
 
             fs.mkdirSync(path.join(this.process.downloadDirectory, this.directoryPath), { recursive: true })
 
-            await pipeline(stream.data, fs.createWriteStream(streamPath))
+            const writeStream = fs.createWriteStream(streamPath, {
+                flags: startByte > 0 ? "a" : "w"
+            })
+
             clearTimeout(controller.timeoutId)
         } catch (error) {
             if (error?.code === "ERR_CANCELED" && error?.cause?.code === "ETIMEDOUT") {
@@ -196,7 +200,10 @@ export default class File {
             return
         }
 
-        fs.renameSync(path.join(this.process.downloadDirectory, this.directoryPath, `${this.name}.part`), path.join(this.process.downloadDirectory, this.directoryPath, this.name))
+
+        const finalPath = path.join(this.process.downloadDirectory, this.directoryPath, this.name)
+        await this.decryptFileContent(streamPath, finalPath)
+        fs.unlinkSync(streamPath)
         fs.writeFileSync(path.join(this.process.downloadDirectory, this.directoryPath, `.downloaded.${this.name}`), '')
 
         this.downloadedBytes = this.size
@@ -222,5 +229,31 @@ export default class File {
     isTimeoutError(error) {
         const code = error?.code
         return code === "ETIMEDOUT" || code === "ECONNRESET" || code === "ECONNABORTED" || error?.name === "AbortError"
+    }
+
+    async decryptFileContent(inputPath, outputPath) {
+        const nodeKeyB64 = this.node.k.split(":").at(-1)
+        const nodeKeyBytes = b64urlToBuffer(nodeKeyB64)
+        const nodeKeyHex = aes128EcbDecrypt(this.process.folderKey, nodeKeyBytes).toString("hex")
+
+        if (nodeKeyHex.length < 64) {
+            throw new Error("Invalid node key length for file content")
+        }
+
+        const w = []
+        for (let i = 0; i < 8; i++) w.push(nodeKeyHex.slice(i * 8, i * 8 + 8))
+
+        const fileKeyHex = xor32hex(w[0], w[4]) + xor32hex(w[1], w[5]) + xor32hex(w[2], w[6]) + xor32hex(w[3], w[7])
+        const ivHex = w[4] + w[5] + "00000000" + "00000000"
+
+        const key = Buffer.from(fileKeyHex, "hex")
+        const iv = Buffer.from(ivHex, "hex")
+        const decipher = crypto.createDecipheriv("aes-128-ctr", key, iv)
+
+        await pipeline(
+            fs.createReadStream(inputPath),
+            decipher,
+            fs.createWriteStream(outputPath, { flags: "w" })
+        )
     }
 }
