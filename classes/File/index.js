@@ -147,6 +147,12 @@ export default class File {
 
             let downloaded = 0
 
+            const streamError = new Promise((_, reject) => {
+                // stream.data.once("error", reject)
+                stream.data.once("error", error => {
+                    reject(error)
+                })
+            })
             stream.data.on("data", chunk => {
                 resetTimeout()
                 const now = Date.now()
@@ -178,6 +184,10 @@ export default class File {
                 flags: startByte > 0 ? "a" : "w"
             })
 
+            await Promise.race([
+                pipeline(stream.data, writeStream),
+                streamError
+            ])
             clearTimeout(controller.timeoutId)
         } catch (error) {
             if (error?.code === "ERR_CANCELED" && error?.cause?.code === "ETIMEDOUT") {
