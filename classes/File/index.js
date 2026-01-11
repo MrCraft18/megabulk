@@ -264,12 +264,33 @@ export default class File {
 
         const key = Buffer.from(fileKeyHex, "hex")
         const iv = Buffer.from(ivHex, "hex")
-        const decipher = crypto.createDecipheriv("aes-128-ctr", key, iv)
 
-        await pipeline(
-            fs.createReadStream(inputPath),
-            decipher,
-            fs.createWriteStream(outputPath, { flags: "w" })
-        )
+        const maxAttempts = 3
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            const decipher = crypto.createDecipheriv("aes-128-ctr", key, iv)
+            try {
+                await pipeline(
+                    fs.createReadStream(inputPath),
+                    decipher,
+                    fs.createWriteStream(outputPath, { flags: "w" })
+                )
+                return
+            } catch (error) {
+                if (fs.existsSync(outputPath)) {
+                    try {
+                        fs.unlinkSync(outputPath)
+                    } catch (cleanupError) {
+                        if (error?.code !== "EIO" || attempt === maxAttempts) {
+                            throw cleanupError
+                        }
+                    }
+                }
+                if (error?.code !== "EIO" || attempt === maxAttempts) {
+                    throw error
+                }
+                await new Promise(res => setTimeout(res, 250 * attempt))
+            }
+        }
+
     }
 }
