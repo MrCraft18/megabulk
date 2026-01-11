@@ -207,7 +207,6 @@ export default class MegabulkProcess {
         this.lastRenderLines = 0
         this.lastRenderRows = process.stdout.rows || 24
         this.renderStartTime = Date.now()
-        this.bytesAtRenderStart = this.fileQueue.reduce((sum, file) => sum + (file.downloadedBytes || 0), 0)
         process.stdout.write("\x1b[?25l")
         this.configureScrollRegion()
         this.renderInterval = setInterval(() => this.render(), 200)

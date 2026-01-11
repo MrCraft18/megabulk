@@ -42,7 +42,6 @@ export default class File {
 
         this.downloadedBytes = 0
         this.startedAt = null
-        this.lastTickBytes = 0
         this.lastTickTime = 0
         this.speed = 0
         this.eta = 0
@@ -122,7 +121,6 @@ export default class File {
         this.startByte = startByte
         this.downloadedBytes = startByte
         this.startedAt = Date.now()
-        this.lastTickBytes = this.downloadedBytes
         this.lastTickTime = this.startedAt
         this.speedSamples = [{ time: this.startedAt, bytes: this.downloadedBytes }]
 
@@ -147,8 +145,6 @@ export default class File {
                 signal: controller.signal
             })
 
-            let downloaded = 0
-
             const streamError = new Promise((_, reject) => {
                 // stream.data.once("error", reject)
                 stream.data.once("error", error => {
@@ -159,7 +155,6 @@ export default class File {
             stream.data.on("data", chunk => {
                 resetTimeout()
                 const now = Date.now()
-                downloaded += chunk.length
                 this.downloadedBytes += chunk.length
                 const deltaTime = (now - this.lastTickTime) / 1000
                 if (deltaTime > 0) {
@@ -180,7 +175,6 @@ export default class File {
                     const avgSpeed = elapsed > 0 ? bytesDelta / elapsed : 0
                     this.eta = avgSpeed > 0 ? remaining / avgSpeed : 0
                 }
-                this.lastTickBytes = this.downloadedBytes
                 this.lastTickTime = now
             })
 
