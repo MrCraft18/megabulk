@@ -54,7 +54,7 @@ export default class File {
             this.downloadedBytes = this.size
             this.status = "already downloaded"
 
-            if (this.process.fileQueue.length === 0) {
+            if (this.process.pendingFileCount() === 0) {
                 this.process.resolveAllFilesDownloaded()
             } else {
                 this.process.enqueueFileDownloads()
@@ -226,7 +226,7 @@ export default class File {
         this.status = 'downloaded'
         this.returnProxy('working')
 
-        if (this.process.fileQueue.length === 0) {
+        if (this.process.pendingFileCount() === 0) {
             this.process.resolveAllFilesDownloaded()
         } else {
             this.process.enqueueFileDownloads()

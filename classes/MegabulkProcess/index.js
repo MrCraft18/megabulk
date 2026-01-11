@@ -70,6 +70,11 @@ export default class MegabulkProcess {
         return status ? this.fileQueue.filter(file => file.status == status).length : this.fileQueue.length
     }
 
+    pendingFileCount() {
+        const pendingStatuses = new Set(["waiting", "finding proxy", "downloading"])
+        return this.fileQueue.filter(file => pendingStatuses.has(file.status)).length
+    }
+
     async findAndInsertProxies() {
         let added = 0
 
