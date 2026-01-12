@@ -6,6 +6,8 @@ import crypto from "node:crypto"
 import decryptNodeAttributes from "./functions/decryptNodeAttributes.js";
 import { aes128EcbDecrypt, xor32hex, b64urlToBuffer } from "../../common/megaCrypto.js"
 
+const PROXY_COOLDOWN_MS = 10 * 60_000
+
 export default class File {
     constructor(node, process) {
         this.process = process
@@ -89,13 +91,8 @@ export default class File {
 
                 this.downloadURL = response.data[0].g
             } catch (error) {
-                if (this.isTimeoutError(error)) {
-                    this.proxy.attempts++
-                    this.returnProxy()
-                } else {
-                    this.returnProxy('broken')
-                }
-
+                this.applyProxyCooldown()
+                this.returnProxy()
             }
         }
 
@@ -194,15 +191,8 @@ export default class File {
                 error = error.cause
             }
 
-            if (error?.response?.status === 509) {
-                this.proxy.cooldownUntil = Date.now() + 5 * 60_000
-                this.returnProxy()
-            } else if (this.isTimeoutError(error)) {
-                this.proxy.attempts++
-                this.returnProxy()
-            } else {
-                this.returnProxy('broken')
-            }
+            this.applyProxyCooldown()
+            this.returnProxy()
 
             delete this.downloadURL
 
@@ -227,6 +217,12 @@ export default class File {
         }
     }
 
+    applyProxyCooldown() {
+        const now = Date.now()
+        this.proxy.lastUsed = now
+        this.proxy.cooldownUntil = now + PROXY_COOLDOWN_MS
+    }
+
     returnProxy(pool) {
         this.process.reinsertProxy(this.proxy, pool)
         delete this.proxy
@@ -234,11 +230,6 @@ export default class File {
 
     alreadyDownloaded() {
         return fs.existsSync(path.join(this.process.downloadDirectory, this.directoryPath, `.downloaded.${this.name}`))
-    }
-
-    isTimeoutError(error) {
-        const code = error?.code
-        return code === "ETIMEDOUT" || code === "ECONNRESET" || code === "ECONNABORTED" || error?.name === "AbortError"
     }
 
     async decryptFileContent(inputPath, outputPath) {

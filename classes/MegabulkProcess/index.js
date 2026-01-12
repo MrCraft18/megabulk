@@ -20,8 +20,7 @@ export default class MegabulkProcess {
 
         this.proxyPools = {
             base: new Map(),
-            working: new Map(),
-            broken: new Map()
+            working: new Map()
         }
 
         this.foundNewProxiesPromise = null
@@ -90,7 +89,6 @@ export default class MegabulkProcess {
                 this.proxyPools.base.set(proxy, {
                     address: proxy,
                     agent: makeAgent(proxy),
-                    attempts: 0,
                     lastUsed: 0,
                     cooldownUntil: 0
                 })
@@ -132,72 +130,39 @@ export default class MegabulkProcess {
                 }
             }
 
-            if (this.proxyPools.base.size > 0) {
-                let oldestKey = null
-                let oldestProxy = null
+            let oldestKey = null
+            let oldestProxy = null
 
-                for (const [k, v] of this.proxyPools.base) {
-                    if (!oldestProxy || v.lastUsed < oldestProxy.lastUsed) {
-                        oldestKey = k
-                        oldestProxy = v
-                    }
-                }
-
-                if (oldestKey) {
-                    this.proxyPools.base.delete(oldestKey)
-                    oldestProxy.lastUsed = Date.now()
-                    return oldestProxy
+            for (const [k, v] of this.proxyPools.base) {
+                if (!oldestProxy || v.lastUsed < oldestProxy.lastUsed) {
+                    oldestKey = k
+                    oldestProxy = v
                 }
             }
 
-            return null
+            if (oldestKey) {
+                this.proxyPools.base.delete(oldestKey)
+                oldestProxy.lastUsed = Date.now()
+                return oldestProxy
+            }
         })()
 
-        if (proxy) {
-            const now = Date.now()
-            if (proxy.cooldownUntil && proxy.cooldownUntil > now) {
-                await new Promise(res => setTimeout(res, proxy.cooldownUntil - now))
-            }
-            return proxy
+        const now = Date.now()
+        if (proxy.cooldownUntil && proxy.cooldownUntil > now) {
+            await new Promise(res => setTimeout(res, proxy.cooldownUntil - now))
         }
-
-        if (!this.foundNewProxiesPromise) {
-            this.startProxyRefreshLoop()
-        }
-
-        await this.foundNewProxiesPromise
-        return await this.popProxy()
-    }
-
-    async startProxyRefreshLoop() {
-        const { promise, resolve } = Promise.withResolvers()
-        this.foundNewProxiesPromise = promise
-        const resolveFoundNewProxies = resolve
-
-        let added = await this.findAndInsertProxies()
-
-        while (!added) {
-            added = await this.findAndInsertProxies()
-            await new Promise(res => setTimeout(res, 5 * 60_000))
-        }
-
-        resolveFoundNewProxies()
-        this.foundNewProxiesPromise = null
+        return proxy
     }
 
     hasProxy(address) {
-        return this.proxyPools.base.has(address) || this.proxyPools.working.has(address) || this.proxyPools.broken.has(address)
+        return this.proxyPools.base.has(address) || this.proxyPools.working.has(address)
     }
 
     reinsertProxy(proxy, pool = 'base') {
         if (!proxy) throw new Error('No proxy passed to reinsertProxy')
 
-        if (pool === 'working') proxy.attempts = 0
-        if (proxy.attempts >= 5) pool = 'broken'
-
         this.proxyPools.base.delete(proxy.address)
         this.proxyPools.working.delete(proxy.address)
-        this.proxyPools.broken.delete(proxy.address)
         this.proxyPools[pool].set(proxy.address, proxy)
     }
 
@@ -258,8 +223,11 @@ export default class MegabulkProcess {
             lines.push("-".repeat(Math.max(columns - 1, 0)))
         }
 
-        const usableProxies = this.proxyPools.base.size + this.proxyPools.working.size
-        const totalProxies = usableProxies + this.proxyPools.broken.size
+        const now = Date.now()
+        const readyBase = [...this.proxyPools.base.values()].filter(proxy => !proxy.cooldownUntil || proxy.cooldownUntil <= now).length
+        const readyWorking = [...this.proxyPools.working.values()].filter(proxy => !proxy.cooldownUntil || proxy.cooldownUntil <= now).length
+        const usableProxies = readyBase + readyWorking
+        const totalProxies = this.proxyPools.base.size + this.proxyPools.working.size
         const downloadedFiles = this.fileQueue.filter(file => file.status === 'downloaded' || file.status === 'already downloaded').length
         const bytesSoFar = this.fileQueue.reduce((sum, file) => sum + (file.downloadedBytes || 0), 0)
         const activeCount = activeFiles.length
