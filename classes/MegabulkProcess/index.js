@@ -15,7 +15,7 @@ export default class MegabulkProcess {
         const folderKeyB64 = folderLink.split('#').at(-1)
         this.folderKey = b64urlToBuffer(folderKeyB64).toString('hex')
 
-        this.maxConcurrentDownloads = 10
+        this.maxConcurrentDownloads = 20
         this.maxConcurrentProxyChecking = 50
 
         this.proxyPools = {
