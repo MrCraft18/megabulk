@@ -3,6 +3,7 @@ import { HttpsProxyAgent } from "https-proxy-agent"
 import { SocksProxyAgent } from "socks-proxy-agent"
 
 import File from '../File/index.js'
+import ProxyWorker from "../ProxyWorker/index.js"
 import { b64urlToBuffer } from "../../common/megaCrypto.js"
 
 export default class MegabulkProcess {
@@ -16,52 +17,95 @@ export default class MegabulkProcess {
         this.folderKey = b64urlToBuffer(folderKeyB64).toString('hex')
 
         this.maxConcurrentDownloads = 20
-        this.maxConcurrentProxyChecking = 50
+        this.proxyWorkerAmount = 100
+
+        this.flatten = true
 
         this.proxyPools = {
             base: new Map(),
             working: new Map()
         }
 
+        this.proxyPools.working.set('direct://', {
+            address: 'direct://',
+            agent: null,
+            lastUsed: 0,
+            cooldownUntil: 0
+        })
+
+        this.proxyWorkers = Array.from({ length: this.proxyWorkerAmount }, () => new ProxyWorker(this))
+
         this.foundNewProxiesPromise = null
+        this.proxyRefreshInterval = null
+        this.finished = false
     }
 
     async start() {
-        await this.findAndInsertProxies()
-        setInterval(() => {
-            if (!this.foundNewProxiesPromise) this.findAndInsertProxies()
-        }, 60 * 60_000)
-
+        const { promise, resolve, reject } = Promise.withResolvers()
+        this.allFilesDownloaded = promise
+        this.resolveAllFilesDownloaded = resolve
+        
         this.allNodes = await axios.post('https://g.api.mega.co.nz/cs', [{ a: "f", c: 1, r: 1 }], {
             params: { id: Date.now(), n: this.folderHandle },
             headers: { "Content-Type": "application/json" },
         }).then(response => response.data[0].f)
 
-        this.fileQueue = this.allNodes.filter(node => node.t === 0).map(node => new File(node, this))
+        this.fileQueue = this.allNodes.filter(node => node.t === 0).map(node => {
+            const file = new File(node, this)
+               
+            if (file.alreadyDownloaded()) {
+                file.downloadedBytes = file.size
+                file.status = "already downloaded"
+            }
+
+            return file
+        })
+
+        if (this.fileQueue.every(file => file.status === 'already downloaded')) {
+            this.finishAllDownloads()
+            return
+        }
+
         this.totalFiles = this.fileQueue.length
         this.totalBytes = this.fileQueue.reduce((sum, file) => sum + (file.size || 0), 0)
+
+        // for (const file of this.fileQueue) {
+        //     if (file.status === "waiting") console.log(file.directoryPath, file.name, file.node)
+        // }
 
         if (!this.fileQueue.length) {
             console.log('No files in Folder to Download')
             return
         }
 
+        await this.findAndInsertProxies()
+        this.proxyRefreshInterval = setInterval(() => {
+            if (!this.foundNewProxiesPromise) this.findAndInsertProxies()
+        }, 60 * 60_000)
+
         console.clear()
         this.startRenderLoop()
-        this.enqueueFileDownloads()
-
-        const { promise, resolve, reject } = Promise.withResolvers()
-        this.allFilesDownloaded = promise
-        this.resolveAllFilesDownloaded = resolve
+        this.ensureProxyWorkers()
 
         return this.allFilesDownloaded
     }
 
-    enqueueFileDownloads() {
-        while (this.queueCount('finding proxy') < this.maxConcurrentProxyChecking && this.queueCount('downloading') < this.maxConcurrentDownloads) {
-            const awaitingFile = this.fileQueue.find(file => file.status === 'waiting')
-            if (!awaitingFile) break
-            awaitingFile.download()
+    finishAllDownloads() {
+        if (this.finished) return
+        this.finished = true
+        this.stopRenderLoop()
+        if (this.proxyRefreshInterval) {
+            clearInterval(this.proxyRefreshInterval)
+            this.proxyRefreshInterval = null
+        }
+        console.log('All Files Downloaded')
+        this.resolveAllFilesDownloaded()
+        process.exit(0)
+    }
+
+    ensureProxyWorkers() {
+        for (const proxyWorker of this.proxyWorkers) {
+            if (proxyWorker.status === 'offline') proxyWorker.startChecking()
         }
     }
 
@@ -70,13 +114,11 @@ export default class MegabulkProcess {
     }
 
     pendingFileCount() {
-        const pendingStatuses = new Set(["waiting", "finding proxy", "downloading"])
+        const pendingStatuses = new Set(["waiting", "requesting stream", "downloading"])
         return this.fileQueue.filter(file => pendingStatuses.has(file.status)).length
     }
 
     async findAndInsertProxies() {
-        let added = 0
-
         const fetchedProxies =  [
             ...(await axios.get('https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/all/data.txt').then(response => response.data)).split('\n'),
             ...(await axios.get('https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt').then(response => response.data)).split('\n').map(address => 'socks5://' + address),
@@ -92,7 +134,6 @@ export default class MegabulkProcess {
                     lastUsed: 0,
                     cooldownUntil: 0
                 })
-                added++
             }
         }
 
@@ -111,8 +152,6 @@ export default class MegabulkProcess {
 
             throw new Error(`Unknown proxy URL: ${proxyURL}`)
         }
-
-        return added
     }
 
     async popProxy() {
@@ -165,7 +204,6 @@ export default class MegabulkProcess {
         this.proxyPools.working.delete(proxy.address)
         this.proxyPools[pool].set(proxy.address, proxy)
     }
-
 
     startRenderLoop() {
         if (this.renderInterval) return

@@ -1,12 +1,106 @@
 import axios from "axios"
 import fs from "fs"
 import path from "path";
-import { pipeline } from "node:stream/promises"
+import { pipeline, finished } from "node:stream/promises"
 import crypto from "node:crypto"
 import decryptNodeAttributes from "./functions/decryptNodeAttributes.js";
 import { aes128EcbDecrypt, xor32hex, b64urlToBuffer } from "../../common/megaCrypto.js"
 
 const PROXY_COOLDOWN_MS = 10 * 60_000
+const MAC_CHUNK_BASE = 128 * 1024
+
+const getMacChunkSize = index => (index < 8 ? index + 1 : 8) * MAC_CHUNK_BASE
+
+const aesEncryptBlock = (cipher, block) => cipher.update(block)
+
+const incrementCounter = (counter, blocks) => {
+    let carry = BigInt(blocks)
+    for (let i = counter.length - 1; i >= 0 && carry > 0n; i--) {
+        const sum = BigInt(counter[i]) + (carry & 0xffn)
+        counter[i] = Number(sum & 0xffn)
+        carry = (carry >> 8n) + (sum >> 8n)
+    }
+}
+
+const createCtrDecipherForOffset = (key, iv, offset) => {
+    const counter = Buffer.from(iv)
+    const blockOffset = BigInt(Math.floor(offset / 16))
+    incrementCounter(counter, blockOffset)
+
+    const decipher = crypto.createDecipheriv("aes-128-ctr", key, counter)
+    const skipBytes = offset % 16
+    if (skipBytes > 0) {
+        decipher.update(Buffer.alloc(skipBytes))
+    }
+    return decipher
+}
+
+const createMacState = (key, nonce) => {
+    const cipher = crypto.createCipheriv("aes-128-ecb", key, null)
+    cipher.setAutoPadding(false)
+    const macIv = Buffer.concat([nonce, nonce])
+
+    return {
+        cipher,
+        position: 0,
+        chunkIndex: 0,
+        nextBoundary: getMacChunkSize(0),
+        chunkMacIv: macIv,
+        chunkMac: Buffer.from(macIv),
+        metaMac: Buffer.alloc(16, 0)
+    }
+}
+
+const closeMacChunk = state => {
+    for (let i = 0; i < 16; i++) {
+        state.metaMac[i] ^= state.chunkMac[i]
+    }
+    state.metaMac = Buffer.from(aesEncryptBlock(state.cipher, state.metaMac))
+    state.chunkMac = Buffer.from(state.chunkMacIv)
+    state.chunkIndex += 1
+    state.nextBoundary += getMacChunkSize(state.chunkIndex)
+}
+
+const updateMacState = (state, data) => {
+    for (let i = 0; i < data.length; i++) {
+        const blockOffset = state.position % 16
+        state.chunkMac[blockOffset] ^= data[i]
+        state.position += 1
+
+        if (state.position % 16 === 0) {
+            state.chunkMac = Buffer.from(aesEncryptBlock(state.cipher, state.chunkMac))
+        }
+
+        if (state.position === state.nextBoundary) {
+            closeMacChunk(state)
+        }
+    }
+}
+
+const finalizeMacState = state => {
+    const blockOffset = state.position % 16
+    if (blockOffset !== 0) {
+        for (let i = blockOffset; i < 16; i++) {
+            state.chunkMac[i] ^= 0
+        }
+        state.position += 16 - blockOffset
+        state.chunkMac = Buffer.from(aesEncryptBlock(state.cipher, state.chunkMac))
+    }
+
+    const currentChunkStart = state.nextBoundary - getMacChunkSize(state.chunkIndex)
+    if (state.position > currentChunkStart) {
+        closeMacChunk(state)
+    }
+
+    const mac = Buffer.alloc(8)
+    for (let i = 0; i < 4; i++) {
+        mac[i] = state.metaMac[i] ^ state.metaMac[i + 4]
+        mac[i + 4] = state.metaMac[i + 8] ^ state.metaMac[i + 12]
+    }
+
+    state.cipher.final()
+    return mac
+}
 
 export default class File {
     constructor(node, process) {
@@ -50,109 +144,172 @@ export default class File {
         this.speedSamples = []
     }
 
-    async download() {
-        if (this.alreadyDownloaded()) {
-            this.downloadedBytes = this.size
-            this.status = "already downloaded"
+    async streamFile(downloadURL, proxy) {
+        this.status = 'requesting stream'
 
-            if (this.process.pendingFileCount() === 0) {
-                this.process.resolveAllFilesDownloaded()
-            } else {
-                this.process.enqueueFileDownloads()
+        const streamPath = path.join(this.process.downloadDirectory, this.process.flatten ? '' : this.directoryPath, `${this.name}.part`)
+        const cryptoParams = this.getFileCryptoParams()
+        const maxMacAttempts = 2
+
+        for (let attempt = 1; attempt <= maxMacAttempts; attempt++) {
+            let startByte = fs.existsSync(streamPath) ? fs.statSync(streamPath).size : 0
+            if (startByte > this.size) {
+                fs.unlinkSync(streamPath)
+                startByte = 0
             }
 
-            return
-        }
+            this.startByte = startByte
+            this.downloadedBytes = startByte
+            this.startedAt = Date.now()
+            this.lastTickTime = this.startedAt
+            this.speedSamples = [{ time: this.startedAt, bytes: this.downloadedBytes }]
 
-        this.status = 'finding proxy'
+            const macState = createMacState(cryptoParams.key, cryptoParams.nonce)
+            if (startByte > 0) {
+                this.status = 'verifying resume'
+                await this.recomputeMacFromPartial(streamPath, cryptoParams, macState)
+            }
 
-        while (!this.downloadURL) {
-            if (this.process.queueCount('downloading') >= this.process.maxConcurrentDownloads) {
-                this.status = 'waiting'
-
-                delete this.downloadURL
-
+            try {
+                await this.downloadChunks(downloadURL, proxy, streamPath, cryptoParams, macState)
+            } catch (error) {
+                this.handleStreamError(error, proxy)
                 return
             }
 
-            this.proxy = await this.process.popProxy()
+            const computedMac = finalizeMacState(macState)
+            if (!computedMac.equals(cryptoParams.metaMac)) {
+                if (fs.existsSync(streamPath)) {
+                    fs.unlinkSync(streamPath)
+                }
+                this.downloadedBytes = 0
+                this.status = 'waiting'
 
-            if (!this.proxy) throw new Error('Ran out of proxies')
+                if (attempt < maxMacAttempts) {
+                    continue
+                }
 
-            try {
-                const response = await axios.post('https://g.api.mega.co.nz/cs', [{ a: "g", g: 1, ssl: 0, n: this.id }], {
-                    params: { id: Date.now(), n: this.process.folderHandle },
-                    headers: { "Content-Type": "application/json" },
-                    httpAgent: this.proxy.agent,
-                    httpsAgent: this.proxy.agent,
-                    proxy: false,
-                    signal: AbortSignal.timeout(10000)
-                })
-
-                this.downloadURL = response.data[0].g
-            } catch (error) {
-                this.applyProxyCooldown()
-                this.returnProxy()
+                const error = new Error("MAC mismatch")
+                error.code = "EMACMISMATCH"
+                this.handleStreamError(error, proxy)
+                return
             }
+
+            break
         }
 
-        if (this.process.queueCount('downloading') >= this.process.maxConcurrentDownloads) {
-            this.status = 'waiting'
+        const finalPath = path.join(this.process.downloadDirectory, this.process.flatten ? '' : this.directoryPath, this.name)
+        await this.decryptFileContent(streamPath, finalPath, cryptoParams)
+        fs.unlinkSync(streamPath)
+        fs.writeFileSync(path.join(this.process.downloadDirectory, this.process.flatten ? '' : this.directoryPath, `.downloaded.${this.name}`), '')
 
-            this.returnProxy('working')
-            
-            delete this.downloadURL
+        this.downloadedBytes = this.size
+        this.status = 'downloaded'
+        this.process.reinsertProxy(proxy, 'working')
 
-            return
+        if (this.process.pendingFileCount() === 0) {
+            this.process.finishAllDownloads()
+        } else {
+            this.process.ensureProxyWorkers()
         }
-
-        this.streamFile()
     }
 
-    async streamFile() {
-        this.status = 'downloading'
-        this.process.enqueueFileDownloads()
+    getFileCryptoParams() {
+        const nodeKeyB64 = this.node.k.split(":").at(-1)
+        const nodeKeyBytes = b64urlToBuffer(nodeKeyB64)
+        const nodeKeyHex = aes128EcbDecrypt(this.process.folderKey, nodeKeyBytes).toString("hex")
 
-        const streamPath = path.join(this.process.downloadDirectory, this.directoryPath, `${this.name}.part`)
-        const startByte = fs.existsSync(streamPath) ? fs.statSync(streamPath).size : 0
-        this.startByte = startByte
-        this.downloadedBytes = startByte
-        this.startedAt = Date.now()
-        this.lastTickTime = this.startedAt
-        this.speedSamples = [{ time: this.startedAt, bytes: this.downloadedBytes }]
+        if (nodeKeyHex.length < 64) {
+            throw new Error("Invalid node key length for file content")
+        }
 
-        try {
+        const words = []
+        for (let i = 0; i < 8; i++) {
+            words.push(nodeKeyHex.slice(i * 8, i * 8 + 8))
+        }
+
+        const fileKeyHex = xor32hex(words[0], words[4]) + xor32hex(words[1], words[5]) + xor32hex(words[2], words[6]) + xor32hex(words[3], words[7])
+        const ivHex = words[4] + words[5] + "00000000" + "00000000"
+
+        return {
+            key: Buffer.from(fileKeyHex, "hex"),
+            iv: Buffer.from(ivHex, "hex"),
+            nonce: Buffer.from(words[4] + words[5], "hex"),
+            metaMac: Buffer.from(words[6] + words[7], "hex")
+        }
+    }
+
+    async recomputeMacFromPartial(streamPath, cryptoParams, macState) {
+        const decipher = createCtrDecipherForOffset(cryptoParams.key, cryptoParams.iv, 0)
+        const readStream = fs.createReadStream(streamPath)
+
+        for await (const chunk of readStream) {
+            const decrypted = decipher.update(chunk)
+            updateMacState(macState, decrypted)
+        }
+
+        const final = decipher.final()
+        if (final.length) {
+            updateMacState(macState, final)
+        }
+    }
+
+    async downloadChunks(downloadURL, proxy, streamPath, cryptoParams, macState) {
+        const chunkSize = 256 * 1024 * 1024
+        fs.mkdirSync(path.join(this.process.downloadDirectory, this.process.flatten ? '' : this.directoryPath), { recursive: true })
+
+        while (this.downloadedBytes < this.size) {
+            const chunkStart = this.downloadedBytes
+            const chunkEnd = Math.min(chunkStart + chunkSize - 1, Math.max(this.size - 1, 0))
+            const chunkUrl = `${downloadURL}/${chunkStart}-${chunkEnd}`
+
             const controller = new AbortController()
-            function resetTimeout() {
+            const resetTimeout = () => {
                 clearTimeout(controller.timeoutId)
                 controller.timeoutId = setTimeout(() => {
                     const err = new Error("Stream timeout")
                     err.code = "ETIMEDOUT"
                     controller.abort(err)
-                }, 10_000)
+                }, 5_000)
             }
             resetTimeout()
 
-            const stream = await axios.get(this.downloadURL, {
+            const streamConfig = {
                 responseType: "stream",
-                headers: startByte ? { Range: `bytes=${startByte}-` } : {},
-                httpAgent: this.proxy.agent,
-                httpsAgent: this.proxy.agent,
+                headers: {
+                    Accept: "*/*",
+                    "Accept-Encoding": "deflate, gzip, br, zstd",
+                    "Accept-Language": "en-US;q=0.8,en;q=0.3",
+                    "Cache-Control": "no-cache",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    DNT: "1",
+                    Origin: "https://mega.nz",
+                    Pragma: "no-cache",
+                    Referer: "https://mega.nz/",
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:137.0) Gecko/20100101 Firefox/137.0"
+                },
                 proxy: false,
                 signal: controller.signal
-            })
+            }
 
-            const streamError = new Promise((_, reject) => {
-                // stream.data.once("error", reject)
-                stream.data.once("error", error => {
-                    reject(error)
-                })
-            })
+            if (proxy.agent) {
+                streamConfig.httpAgent = proxy.agent
+                streamConfig.httpsAgent = proxy.agent
+            }
 
-            stream.data.on("data", chunk => {
+            const stream = await axios.post(chunkUrl, null, streamConfig)
+            const decipher = createCtrDecipherForOffset(cryptoParams.key, cryptoParams.iv, chunkStart)
+
+            stream.data.once("data", () => this.status = 'downloading')
+
+            const onData = chunk => {
                 resetTimeout()
                 const now = Date.now()
                 this.downloadedBytes += chunk.length
+
+                const decrypted = decipher.update(chunk)
+                updateMacState(macState, decrypted)
+
                 const deltaTime = (now - this.lastTickTime) / 1000
                 if (deltaTime > 0) {
                     this.speedSamples.push({ time: now, bytes: this.downloadedBytes })
@@ -173,86 +330,53 @@ export default class File {
                     this.eta = avgSpeed > 0 ? remaining / avgSpeed : 0
                 }
                 this.lastTickTime = now
-            })
-
-            fs.mkdirSync(path.join(this.process.downloadDirectory, this.directoryPath), { recursive: true })
-
-            const writeStream = fs.createWriteStream(streamPath, {
-                flags: startByte > 0 ? "a" : "w"
-            })
-
-            await Promise.race([
-                pipeline(stream.data, writeStream),
-                streamError
-            ])
-            clearTimeout(controller.timeoutId)
-        } catch (error) {
-            if (error?.code === "ERR_CANCELED" && error?.cause?.code === "ETIMEDOUT") {
-                error = error.cause
             }
 
-            this.applyProxyCooldown()
-            this.returnProxy()
+            stream.data.on("data", onData)
 
-            delete this.downloadURL
+            const writeStream = fs.createWriteStream(streamPath, {
+                flags: chunkStart > 0 ? "a" : "w"
+            })
 
-            this.download()
-            return
-        }
+            await Promise.all([
+                pipeline(stream.data, writeStream),
+                finished(stream.data)
+            ])
 
+            stream.data.off("data", onData)
+            clearTimeout(controller.timeoutId)
 
-        const finalPath = path.join(this.process.downloadDirectory, this.directoryPath, this.name)
-        await this.decryptFileContent(streamPath, finalPath)
-        fs.unlinkSync(streamPath)
-        fs.writeFileSync(path.join(this.process.downloadDirectory, this.directoryPath, `.downloaded.${this.name}`), '')
+            const final = decipher.final()
+            if (final.length) {
+                updateMacState(macState, final)
+            }
 
-        this.downloadedBytes = this.size
-        this.status = 'downloaded'
-        this.returnProxy('working')
-
-        if (this.process.pendingFileCount() === 0) {
-            this.process.resolveAllFilesDownloaded()
-        } else {
-            this.process.enqueueFileDownloads()
+            if (this.downloadedBytes <= chunkStart) {
+                throw new Error("Stream returned no data")
+            }
         }
     }
 
-    applyProxyCooldown() {
+    handleStreamError(error, proxy) {
         const now = Date.now()
-        this.proxy.lastUsed = now
-        this.proxy.cooldownUntil = now + PROXY_COOLDOWN_MS
-    }
+        proxy.lastUsed = now
+        proxy.cooldownUntil = now + PROXY_COOLDOWN_MS
+        this.process.reinsertProxy(proxy)
 
-    returnProxy(pool) {
-        this.process.reinsertProxy(this.proxy, pool)
-        delete this.proxy
+        this.status = 'waiting'
+        this.process.ensureProxyWorkers()
     }
 
     alreadyDownloaded() {
-        return fs.existsSync(path.join(this.process.downloadDirectory, this.directoryPath, `.downloaded.${this.name}`))
+        return fs.existsSync(path.join(this.process.downloadDirectory, this.process.flatten ? '' : this.directoryPath, `.downloaded.${this.name}`))
     }
 
-    async decryptFileContent(inputPath, outputPath) {
-        const nodeKeyB64 = this.node.k.split(":").at(-1)
-        const nodeKeyBytes = b64urlToBuffer(nodeKeyB64)
-        const nodeKeyHex = aes128EcbDecrypt(this.process.folderKey, nodeKeyBytes).toString("hex")
-
-        if (nodeKeyHex.length < 64) {
-            throw new Error("Invalid node key length for file content")
-        }
-
-        const w = []
-        for (let i = 0; i < 8; i++) w.push(nodeKeyHex.slice(i * 8, i * 8 + 8))
-
-        const fileKeyHex = xor32hex(w[0], w[4]) + xor32hex(w[1], w[5]) + xor32hex(w[2], w[6]) + xor32hex(w[3], w[7])
-        const ivHex = w[4] + w[5] + "00000000" + "00000000"
-
-        const key = Buffer.from(fileKeyHex, "hex")
-        const iv = Buffer.from(ivHex, "hex")
-
+    async decryptFileContent(inputPath, outputPath, cryptoParams = null) {
+        const params = cryptoParams ?? this.getFileCryptoParams()
         const maxAttempts = 3
+
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            const decipher = crypto.createDecipheriv("aes-128-ctr", key, iv)
+            const decipher = crypto.createDecipheriv("aes-128-ctr", params.key, params.iv)
             try {
                 await pipeline(
                     fs.createReadStream(inputPath),
@@ -276,6 +400,5 @@ export default class File {
                 await new Promise(res => setTimeout(res, 250 * attempt))
             }
         }
-
     }
 }
