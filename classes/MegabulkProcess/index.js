@@ -1,4 +1,6 @@
 import axios from "axios"
+import { spawn } from "node:child_process"
+import { fileURLToPath } from "node:url"
 import { HttpsProxyAgent } from "https-proxy-agent"
 import { SocksProxyAgent } from "socks-proxy-agent"
 
@@ -38,6 +40,8 @@ export default class MegabulkProcess {
         this.foundNewProxiesPromise = null
         this.proxyRefreshInterval = null
         this.finished = false
+        this.verificationJobs = new Set()
+        this.verifyScriptPath = fileURLToPath(new URL("../../index.js", import.meta.url))
     }
 
     async start() {
@@ -52,10 +56,22 @@ export default class MegabulkProcess {
 
         this.fileQueue = this.allNodes.filter(node => node.t === 0).map(node => {
             const file = new File(node, this)
-               
+
             if (file.alreadyDownloaded()) {
                 file.downloadedBytes = file.size
                 file.status = "already downloaded"
+                return file
+            }
+
+            if (file.hasVerificationMarker()) {
+                if (file.fileExists()) {
+                    file.downloadedBytes = file.size
+                    file.verifyProgress = 0
+                    file.status = "verifying"
+                    this.queueVerification(file, file.getFileCryptoParams(), file.getFinalPath())
+                } else {
+                    file.clearVerificationMarker()
+                }
             }
 
             return file
@@ -114,8 +130,53 @@ export default class MegabulkProcess {
     }
 
     pendingFileCount() {
-        const pendingStatuses = new Set(["waiting", "requesting stream", "downloading"])
+        const pendingStatuses = new Set(["waiting", "requesting stream", "downloading", "verifying"])
         return this.fileQueue.filter(file => pendingStatuses.has(file.status)).length
+    }
+
+    queueVerification(file, cryptoParams, filePath) {
+        const args = [
+            this.verifyScriptPath,
+            "--verify",
+            filePath,
+            cryptoParams.key.toString("hex"),
+            cryptoParams.nonce.toString("hex"),
+            cryptoParams.metaMac.toString("hex")
+        ]
+
+        const child = spawn(process.execPath, args, { stdio: ["ignore", "ignore", "ignore", "ipc"] })
+
+        child.on("message", message => {
+            if (message?.type === "verify-progress" && typeof message.processed === "number") {
+                file.verifyProgress = Math.min(message.processed, file.size || message.processed)
+            }
+        })
+
+        const job = new Promise(resolve => {
+            child.on("exit", code => resolve(code === 0))
+            child.on("error", () => resolve(false))
+        })
+
+        this.verificationJobs.add(job)
+
+        job.then(ok => {
+            if (ok) {
+                file.markVerified()
+            } else {
+                file.handleVerificationFailure()
+            }
+        }).finally(() => {
+            this.verificationJobs.delete(job)
+            this.checkForCompletion()
+        })
+
+        return job
+    }
+
+    checkForCompletion() {
+        if (this.pendingFileCount() === 0 && this.verificationJobs.size === 0) {
+            this.finishAllDownloads()
+        }
     }
 
     async findAndInsertProxies() {
@@ -244,8 +305,21 @@ export default class MegabulkProcess {
             this.configureScrollRegion()
         }
 
+        const verifyingFiles = this.fileQueue.filter(file => file.status === 'verifying')
         const activeFiles = this.fileQueue.filter(file => file.status === 'downloading')
         const lines = []
+
+        for (const file of verifyingFiles) {
+            lines.push([
+                `VERIFYING ${file.name}`,
+                this.formatBytes(file.size, { fixedDecimals: 2 }),
+                `${this.formatPercent(file.verifyProgress || 0, file.size)}`
+            ].join(" | "))
+        }
+
+        if (verifyingFiles.length > 0 && activeFiles.length > 0) {
+            lines.push("-".repeat(Math.max(columns - 1, 0)))
+        }
 
         for (const file of activeFiles) {
             lines.push([

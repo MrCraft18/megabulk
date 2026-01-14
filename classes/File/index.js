@@ -103,6 +103,31 @@ const finalizeMacState = state => {
     return mac
 }
 
+export const verifyFileCbcMac = async (filePath, keyHex, nonceHex, metaMacHex, onProgress = null) => {
+    const key = Buffer.from(keyHex, "hex")
+    const nonce = Buffer.from(nonceHex, "hex")
+    const expectedMac = Buffer.from(metaMacHex, "hex")
+    const macState = createMacState(key, nonce)
+    const fileSize = fs.statSync(filePath).size
+
+    let processed = 0
+    let lastReport = 0
+
+    const readStream = fs.createReadStream(filePath)
+    for await (const chunk of readStream) {
+        updateMacState(macState, chunk)
+        processed += chunk.length
+
+        if (onProgress && (processed - lastReport >= 4 * 1024 * 1024 || processed === fileSize)) {
+            lastReport = processed
+            onProgress(processed, fileSize)
+        }
+    }
+
+    const computedMac = finalizeMacState(macState)
+    return computedMac.equals(expectedMac)
+}
+
 export default class File {
     constructor(node, process) {
         this.process = process
@@ -138,6 +163,7 @@ export default class File {
         this.status = 'waiting'
 
         this.downloadedBytes = 0
+        this.verifyProgress = 0
         this.startedAt = null
         this.lastTickTime = 0
         this.speed = 0
@@ -150,68 +176,32 @@ export default class File {
 
         const streamPath = path.join(this.process.downloadDirectory, this.process.flatten ? '' : this.directoryPath, `${this.name}.part`)
         const cryptoParams = this.getFileCryptoParams()
-        const maxMacAttempts = 2
 
-        for (let attempt = 1; attempt <= maxMacAttempts; attempt++) {
-            let startByte = fs.existsSync(streamPath) ? fs.statSync(streamPath).size : 0
-            if (startByte > this.size) {
-                fs.unlinkSync(streamPath)
-                startByte = 0
-            }
-
-            this.startByte = startByte
-            this.downloadedBytes = startByte
-            this.startedAt = Date.now()
-            this.lastTickTime = this.startedAt
-            this.speedSamples = [{ time: this.startedAt, bytes: this.downloadedBytes }]
-
-            const macState = createMacState(cryptoParams.key, cryptoParams.nonce)
-            if (startByte > 0) {
-                this.status = 'verifying resume'
-                await this.recomputeMacFromPartial(streamPath, cryptoParams, macState)
-            }
-
-            try {
-                await this.downloadChunks(downloadURL, proxy, streamPath, cryptoParams, macState)
-            } catch (error) {
-                this.handleStreamError(error, proxy)
-                return
-            }
-
-            const computedMac = finalizeMacState(macState)
-            if (!computedMac.equals(cryptoParams.metaMac)) {
-                if (fs.existsSync(streamPath)) {
-                    fs.unlinkSync(streamPath)
-                }
-                this.downloadedBytes = 0
-                this.status = 'waiting'
-
-                if (attempt < maxMacAttempts) {
-                    continue
-                }
-
-                const error = new Error("MAC mismatch")
-                error.code = "EMACMISMATCH"
-                this.handleStreamError(error, proxy)
-                return
-            }
-
-            break
+        let startByte = fs.existsSync(streamPath) ? fs.statSync(streamPath).size : 0
+        if (startByte > this.size) {
+            fs.unlinkSync(streamPath)
+            startByte = 0
         }
 
-        const finalPath = path.join(this.process.downloadDirectory, this.process.flatten ? '' : this.directoryPath, this.name)
+        this.startByte = startByte
+        this.downloadedBytes = startByte
+        this.startedAt = Date.now()
+        this.lastTickTime = this.startedAt
+        this.speedSamples = [{ time: this.startedAt, bytes: this.downloadedBytes }]
+
+        try {
+            await this.downloadChunks(downloadURL, proxy, streamPath, cryptoParams)
+        } catch (error) {
+            this.handleStreamError(error, proxy)
+            return
+        }
+
+        const finalPath = this.getFinalPath()
         fs.renameSync(streamPath, finalPath)
-        fs.writeFileSync(path.join(this.process.downloadDirectory, this.process.flatten ? '' : this.directoryPath, `.downloaded.${this.name}`), '')
-
-        this.downloadedBytes = this.size
-        this.status = 'downloaded'
+        this.markVerificationPending()
         this.process.reinsertProxy(proxy, 'working')
-
-        if (this.process.pendingFileCount() === 0) {
-            this.process.finishAllDownloads()
-        } else {
-            this.process.ensureProxyWorkers()
-        }
+        this.process.queueVerification(this, cryptoParams, finalPath)
+        this.process.ensureProxyWorkers()
     }
 
     getFileCryptoParams() {
@@ -239,15 +229,61 @@ export default class File {
         }
     }
 
-    async recomputeMacFromPartial(streamPath, cryptoParams, macState) {
-        const readStream = fs.createReadStream(streamPath)
+    getFinalPath() {
+        return path.join(this.process.downloadDirectory, this.process.flatten ? '' : this.directoryPath, this.name)
+    }
 
-        for await (const chunk of readStream) {
-            updateMacState(macState, chunk)
+    getDownloadedMarkerPath() {
+        return path.join(this.process.downloadDirectory, this.process.flatten ? '' : this.directoryPath, `.downloaded.${this.name}`)
+    }
+
+    getVerificationMarkerPath() {
+        return path.join(this.process.downloadDirectory, this.process.flatten ? '' : this.directoryPath, `.verifying.${this.name}`)
+    }
+
+    hasVerificationMarker() {
+        return fs.existsSync(this.getVerificationMarkerPath())
+    }
+
+    fileExists() {
+        return fs.existsSync(this.getFinalPath())
+    }
+
+    markVerificationPending() {
+        fs.writeFileSync(this.getVerificationMarkerPath(), '')
+        this.downloadedBytes = this.size
+        this.verifyProgress = 0
+        this.status = 'verifying'
+    }
+
+    markVerified() {
+        if (fs.existsSync(this.getVerificationMarkerPath())) {
+            fs.unlinkSync(this.getVerificationMarkerPath())
+        }
+        fs.writeFileSync(this.getDownloadedMarkerPath(), '')
+        this.downloadedBytes = this.size
+        this.verifyProgress = this.size
+        this.status = 'downloaded'
+    }
+
+    clearVerificationMarker() {
+        if (fs.existsSync(this.getVerificationMarkerPath())) {
+            fs.unlinkSync(this.getVerificationMarkerPath())
         }
     }
 
-    async downloadChunks(downloadURL, proxy, streamPath, cryptoParams, macState) {
+    handleVerificationFailure() {
+        this.clearVerificationMarker()
+        if (this.fileExists()) {
+            fs.unlinkSync(this.getFinalPath())
+        }
+        this.downloadedBytes = 0
+        this.verifyProgress = 0
+        this.status = 'waiting'
+        this.process.ensureProxyWorkers()
+    }
+
+    async downloadChunks(downloadURL, proxy, streamPath, cryptoParams) {
         const chunkSize = 256 * 1024 * 1024
         fs.mkdirSync(path.join(this.process.downloadDirectory, this.process.flatten ? '' : this.directoryPath), { recursive: true })
 
@@ -328,18 +364,16 @@ export default class File {
                 transform: (chunk, _encoding, callback) => {
                     try {
                         const decrypted = decipher.update(chunk)
-                        updateMacState(macState, decrypted)
                         callback(null, decrypted)
                     } catch (error) {
                         callback(error)
                     }
                 },
-                flush: function (callback) {
+                flush: callback => {
                     try {
                         const final = decipher.final()
                         if (final.length) {
-                            updateMacState(macState, final)
-                            this.push(final)
+                            decryptStream.push(final)
                         }
                         callback()
                     } catch (error) {
@@ -377,7 +411,7 @@ export default class File {
     }
 
     alreadyDownloaded() {
-        return fs.existsSync(path.join(this.process.downloadDirectory, this.process.flatten ? '' : this.directoryPath, `.downloaded.${this.name}`))
+        return fs.existsSync(this.getDownloadedMarkerPath())
     }
 
     async decryptFileContent(inputPath, outputPath, cryptoParams = null) {
