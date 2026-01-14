@@ -1,6 +1,7 @@
 import axios from "axios"
 import fs from "fs"
 import path from "path";
+import { Transform } from "node:stream"
 import { pipeline, finished } from "node:stream/promises"
 import crypto from "node:crypto"
 import decryptNodeAttributes from "./functions/decryptNodeAttributes.js";
@@ -199,8 +200,7 @@ export default class File {
         }
 
         const finalPath = path.join(this.process.downloadDirectory, this.process.flatten ? '' : this.directoryPath, this.name)
-        await this.decryptFileContent(streamPath, finalPath, cryptoParams)
-        fs.unlinkSync(streamPath)
+        fs.renameSync(streamPath, finalPath)
         fs.writeFileSync(path.join(this.process.downloadDirectory, this.process.flatten ? '' : this.directoryPath, `.downloaded.${this.name}`), '')
 
         this.downloadedBytes = this.size
@@ -240,17 +240,10 @@ export default class File {
     }
 
     async recomputeMacFromPartial(streamPath, cryptoParams, macState) {
-        const decipher = createCtrDecipherForOffset(cryptoParams.key, cryptoParams.iv, 0)
         const readStream = fs.createReadStream(streamPath)
 
         for await (const chunk of readStream) {
-            const decrypted = decipher.update(chunk)
-            updateMacState(macState, decrypted)
-        }
-
-        const final = decipher.final()
-        if (final.length) {
-            updateMacState(macState, final)
+            updateMacState(macState, chunk)
         }
     }
 
@@ -307,9 +300,6 @@ export default class File {
                 const now = Date.now()
                 this.downloadedBytes += chunk.length
 
-                const decrypted = decipher.update(chunk)
-                updateMacState(macState, decrypted)
-
                 const deltaTime = (now - this.lastTickTime) / 1000
                 if (deltaTime > 0) {
                     this.speedSamples.push({ time: now, bytes: this.downloadedBytes })
@@ -334,22 +324,41 @@ export default class File {
 
             stream.data.on("data", onData)
 
+            const decryptStream = new Transform({
+                transform: (chunk, _encoding, callback) => {
+                    try {
+                        const decrypted = decipher.update(chunk)
+                        updateMacState(macState, decrypted)
+                        callback(null, decrypted)
+                    } catch (error) {
+                        callback(error)
+                    }
+                },
+                flush: function (callback) {
+                    try {
+                        const final = decipher.final()
+                        if (final.length) {
+                            updateMacState(macState, final)
+                            this.push(final)
+                        }
+                        callback()
+                    } catch (error) {
+                        callback(error)
+                    }
+                }
+            })
+
             const writeStream = fs.createWriteStream(streamPath, {
                 flags: chunkStart > 0 ? "a" : "w"
             })
 
             await Promise.all([
-                pipeline(stream.data, writeStream),
+                pipeline(stream.data, decryptStream, writeStream),
                 finished(stream.data)
             ])
 
             stream.data.off("data", onData)
             clearTimeout(controller.timeoutId)
-
-            const final = decipher.final()
-            if (final.length) {
-                updateMacState(macState, final)
-            }
 
             if (this.downloadedBytes <= chunkStart) {
                 throw new Error("Stream returned no data")
